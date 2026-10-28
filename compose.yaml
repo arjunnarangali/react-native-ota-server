@@ -1,0 +1,24 @@
+services:
+  db:
+    image: postgres:17
+    container_name: rn-ota-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ota_dev}
+      POSTGRES_USER: ${POSTGRES_USER:-ota_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Copy .env.example to .env and set POSTGRES_PASSWORD}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:-ota_app}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?Copy .env.example to .env and set POSTGRES_APP_PASSWORD}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init/01-create-app-user.sql:/docker-entrypoint-initdb.d/01-create-app-user.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:

@@ -1,0 +1,14 @@
+**
+!app/
+!app/**
+!migrations/
+!migrations/**
+!requirements.txt
+!alembic.ini
+!Dockerfile
+.env*
+.local-keys/
+storage/
+__pycache__/
+**/__pycache__/
+*.py[cod]

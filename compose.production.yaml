@@ -1,0 +1,81 @@
+services:
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env.production}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env.production}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.production}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:?Set POSTGRES_APP_USER in .env.production}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?Set POSTGRES_APP_PASSWORD in .env.production}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init/01-create-app-user.sql:/docker-entrypoint-initdb.d/01-create-app-user.sql:ro
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env.production (use host db)}
+      OTA_ADMIN_TOKEN: ${OTA_ADMIN_TOKEN:?Set a strong OTA_ADMIN_TOKEN in .env.production}
+      OTA_PUBLIC_BASE_URL: ${OTA_PUBLIC_BASE_URL:?Set OTA_PUBLIC_BASE_URL to your HTTPS origin}
+      OTA_SIGNING_PUBLIC_KEY_PATH: /run/ota/ota-publisher-public.pem
+      OTA_STORAGE_DIR: /app/storage/releases
+    volumes:
+      - ota_releases:/app/storage/releases
+      - ${OTA_PUBLIC_KEY_FILE:?Set OTA_PUBLIC_KEY_FILE to this environment's public key}:/run/ota/ota-publisher-public.pem:ro
+    command: >-
+      sh -c "alembic upgrade head &&
+      exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+      --proxy-headers --forwarded-allow-ips '*'"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - backend
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz/ready', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  nginx:
+    image: nginx:stable-alpine
+    restart: unless-stopped
+    environment:
+      DOMAIN_NAME: ${DOMAIN_NAME:?Set DOMAIN_NAME in .env.production}
+      NGINX_ENVSUBST_FILTER: DOMAIN_NAME
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infra/nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - backend
+
+volumes:
+  postgres_data:
+  ota_releases:
+
+networks:
+  backend:
+    driver: bridge
