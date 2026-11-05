@@ -1,4 +1,4 @@
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 
 def publish(client, bundle, *, channel="production", rollout=100, token="test-admin-token"):
@@ -23,13 +23,15 @@ def update_check(
     version=0,
     app_id="com.ota",
     runtime="rn-0.88.0-android-1",
+    channel="production",
     failed_release_id=None,
+    platform="android",
 ):
     payload = {
-            "platform": "android",
+            "platform": platform,
             "app_id": app_id,
             "runtime_version": runtime,
-            "channel": "production",
+            "channel": channel,
             "current_version": version,
             "installation_id": str(uuid4()),
         }
@@ -171,3 +173,165 @@ def test_update_response_can_use_configured_public_origin(release_environment, s
     assert check["release"]["download_url"].startswith(
         "https://ota-example.ngrok.app/api/v1/releases/"
     )
+
+
+def test_ios_release_and_android_release_are_isolated(release_environment, signed_bundle_factory):
+    client = release_environment["client"]
+    lane = {
+        "app_id": "com.ota.shared",
+        "runtime_version": "rn-0.88.0-ios-v1",
+    }
+    ios_bundle = signed_bundle_factory(1, platform="ios", **lane)
+    android_bundle = signed_bundle_factory(1, platform="android", **lane)
+
+    ios_published = publish(client, ios_bundle, channel="development")
+    android_published = publish(client, android_bundle, channel="development")
+
+    assert ios_published.status_code == 201, ios_published.text
+    assert android_published.status_code == 201, android_published.text
+    ios_check = update_check(
+        client, app_id=lane["app_id"], runtime=lane["runtime_version"],
+        platform="ios", channel="development",
+    )
+    android_check = update_check(
+        client, app_id=lane["app_id"], runtime=lane["runtime_version"],
+        platform="android", channel="development",
+    )
+    assert ios_check.json()["release"]["manifest"]["platform"] == "ios"
+    assert android_check.json()["release"]["manifest"]["platform"] == "android"
+    assert ios_check.json()["release"]["manifest"]["version"] == 1
+    assert android_check.json()["release"]["manifest"]["version"] == 1
+    ios_download = client.get(ios_check.json()["release"]["download_url"])
+    assert ios_download.status_code == 200
+    assert ios_download.content == ios_bundle.bundle_path.read_bytes()
+
+    duplicate_android_version = publish(
+        client,
+        signed_bundle_factory(1, platform="android", **lane),
+        channel="development",
+    )
+    assert duplicate_android_version.status_code == 409
+
+
+def test_update_check_rejects_other_platform_and_unknown_platform(release_environment, signed_bundle_factory):
+    client = release_environment["client"]
+    ios_bundle = signed_bundle_factory(
+        1,
+        platform="ios",
+        app_id="com.ota.ios",
+        runtime_version="rn-0.88-ios-v1",
+    )
+    published = publish(client, ios_bundle, channel="development")
+    assert published.status_code == 201, published.text
+
+    android_check = update_check(
+        client,
+        app_id="com.ota.ios",
+        runtime="rn-0.88-ios-v1",
+        channel="development",
+        platform="android",
+    )
+    assert android_check.status_code == 200
+    assert android_check.json() == {"update_available": False, "release": None}
+
+    invalid_platform = client.post(
+        "/api/v1/updates/check",
+        json={
+            "platform": "tvos",
+            "app_id": "com.ota.ios",
+            "runtime_version": "rn-0.88-ios-v1",
+            "channel": "development",
+            "current_version": 0,
+            "installation_id": str(uuid4()),
+        },
+    )
+    assert invalid_platform.status_code == 422
+
+
+def test_admin_rollback_is_scoped_to_its_platform_lane(release_environment, signed_bundle_factory):
+    client = release_environment["client"]
+    lane = {"app_id": "com.ota.sharedadmin", "runtime_version": "rn-0.88-shared"}
+    ios_v1 = publish(client, signed_bundle_factory(1, platform="ios", **lane), channel="development").json()
+    publish(client, signed_bundle_factory(2, platform="ios", **lane), channel="development")
+    publish(client, signed_bundle_factory(1, platform="android", **lane), channel="development")
+    android_v2 = publish(client, signed_bundle_factory(2, platform="android", **lane), channel="development").json()
+
+    rollback = client.post(
+        f"/api/v1/admin/releases/{ios_v1['release_id']}/rollback",
+        headers={"Authorization": "Bearer test-admin-token"},
+    )
+    assert rollback.status_code == 200
+    assert rollback.json()["manifest"]["platform"] == "ios"
+
+    ios_check = update_check(
+        client, app_id=lane["app_id"], runtime=lane["runtime_version"],
+        channel="development", platform="ios", version=2,
+    )
+    android_check = update_check(
+        client, app_id=lane["app_id"], runtime=lane["runtime_version"],
+        channel="development", platform="android", version=1,
+    )
+    assert ios_check.json()["release"]["manifest"]["version"] == 1
+    assert ios_check.json()["release"]["action"] == "rollback"
+    assert android_check.json()["release"]["manifest"]["release_id"] == android_v2["release_id"]
+
+    changed_rollout = client.patch(
+        f"/api/v1/admin/releases/{ios_v1['release_id']}/rollout",
+        headers={"Authorization": "Bearer test-admin-token"},
+        json={"rollout_percentage": 0},
+    )
+    assert changed_rollout.status_code == 200
+    assert update_check(
+        client, app_id=lane["app_id"], runtime=lane["runtime_version"],
+        channel="development", platform="ios", version=2,
+    ).json()["update_available"] is False
+    assert update_check(
+        client, app_id=lane["app_id"], runtime=lane["runtime_version"],
+        channel="development", platform="android", version=1,
+    ).json()["release"]["manifest"]["release_id"] == android_v2["release_id"]
+
+    client.patch(
+        f"/api/v1/admin/releases/{ios_v1['release_id']}/rollout",
+        headers={"Authorization": "Bearer test-admin-token"},
+        json={"rollout_percentage": 100},
+    )
+
+    disabled = client.post(
+        f"/api/v1/admin/releases/{ios_v1['release_id']}/disable",
+        headers={"Authorization": "Bearer test-admin-token"},
+    )
+    assert disabled.status_code == 200
+    assert update_check(
+        client, app_id=lane["app_id"], runtime=lane["runtime_version"],
+        channel="development", platform="ios", version=2,
+    ).json()["update_available"] is False
+    assert update_check(
+        client, app_id=lane["app_id"], runtime=lane["runtime_version"],
+        channel="development", platform="android", version=1,
+    ).json()["release"]["manifest"]["release_id"] == android_v2["release_id"]
+
+
+def test_publish_rejects_source_package_even_when_signed(release_environment, signed_bundle_factory):
+    environment = release_environment
+    source_bundle = signed_bundle_factory(
+        1,
+        platform="ios",
+        app_id="com.ota.iossource",
+        runtime_version="rn-0.88-ios-v1",
+        bundle_format="javascript-source",
+    )
+
+    response = publish(environment["client"], source_bundle, channel="development")
+
+    assert response.status_code == 400
+    assert "Hermes bytecode" in response.json()["detail"]
+    assert not environment["storage"].artifact_path(UUID(source_bundle.release_id)).exists()
+
+
+def test_openapi_lists_supported_platform_values(release_environment):
+    schema = release_environment["client"].get("/openapi.json").json()
+
+    manifest_platforms = schema["components"]["schemas"]["ReleaseManifest"]["properties"]["platform"]["enum"]
+    request_platforms = schema["components"]["schemas"]["UpdateCheckRequest"]["properties"]["platform"]["enum"]
+    assert manifest_platforms == ["android", "ios"]
+    assert request_platforms == ["android", "ios"]

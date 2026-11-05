@@ -3,8 +3,6 @@ import json
 import os
 import stat
 import zipfile
-import json
-import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -15,6 +13,11 @@ class BundlePackageError(ValueError):
     """Raised when an uploaded OTA ZIP does not match the bundle package format."""
 
 
+MAX_ARCHIVE_ENTRIES = 10_000
+MAX_PACKAGE_MANIFEST_BYTES = 1 * 1024 * 1024
+HASH_CHUNK_BYTES = 1024 * 1024
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -23,11 +26,39 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def read_zip_entry(
+    archive: zipfile.ZipFile,
+    entry: zipfile.ZipInfo,
+    max_bytes: int,
+    *,
+    collect: bool = False,
+) -> tuple[bytes, int, str, bytes]:
+    """Read/decompress an entry with an actual-byte cap, not only ZIP header sizes."""
+    digest = hashlib.sha256()
+    output = bytearray() if collect else None
+    prefix = bytearray()
+    total = 0
+    with archive.open(entry) as source:
+        while chunk := source.read(HASH_CHUNK_BYTES):
+            total += len(chunk)
+            if total > max_bytes:
+                raise BundlePackageError("Bundle entry expands beyond the allowed size")
+            if len(prefix) < 4:
+                prefix.extend(chunk[: 4 - len(prefix)])
+            digest.update(chunk)
+            if output is not None:
+                output.extend(chunk)
+    if total != entry.file_size:
+        raise BundlePackageError(f"Bundle entry size does not match ZIP metadata: {entry.filename}")
+    return bytes(output or b""), total, digest.hexdigest(), bytes(prefix)
+
+
 def build_deterministic_package(
     bundle_path: Path,
     assets_dir: Path,
     output_path: Path,
     bundle_format: str = "javascript-source",
+    platform: str = "android",
 ) -> dict[str, Any]:
     """Package a Metro bundle and assets with stable paths, metadata, and ZIP bytes."""
     if not bundle_path.is_file():
@@ -35,7 +66,8 @@ def build_deterministic_package(
     if not assets_dir.is_dir():
         raise FileNotFoundError(f"Metro assets directory not found: {assets_dir}")
 
-    files: dict[str, Path] = {"index.android.bundle": bundle_path}
+    entrypoint = platform_entrypoint(platform)
+    files: dict[str, Path] = {entrypoint: bundle_path}
     asset_metadata: list[dict[str, Any]] = []
 
     for path in sorted(assets_dir.rglob("*")):
@@ -46,7 +78,7 @@ def build_deterministic_package(
         relative_path = path.relative_to(assets_dir).as_posix()
         package_path = f"assets/{relative_path}"
         if relative_path in {
-            "index.android.bundle",
+            entrypoint,
             "ota-manifest.json",
             "release-manifest.json",
             "release-signature.txt",
@@ -63,7 +95,7 @@ def build_deterministic_package(
 
     package_manifest = {
         "format_version": 1,
-        "entrypoint": "index.android.bundle",
+        "entrypoint": entrypoint,
         "entrypoint_format": bundle_format,
         "entrypoint_sha256": sha256_file(bundle_path),
         "assets": asset_metadata,
@@ -102,12 +134,24 @@ def build_deterministic_package(
     }
 
 
-def validate_ota_package(package_path: Path, max_uncompressed_bytes: int) -> None:
+def platform_entrypoint(platform: str) -> str:
+    if platform == "android":
+        return "index.android.bundle"
+    if platform == "ios":
+        return "main.jsbundle"
+    raise BundlePackageError("Unsupported OTA platform")
+
+
+def validate_ota_package(
+    package_path: Path, max_uncompressed_bytes: int, platform: str = "android"
+) -> None:
     """Reject unsafe ZIP paths, oversized expansion, or mismatched internal asset hashes."""
     try:
         with zipfile.ZipFile(package_path) as archive:
             entries = archive.infolist()
             names = [entry.filename for entry in entries]
+            if len(names) < 2 or len(names) > MAX_ARCHIVE_ENTRIES:
+                raise BundlePackageError("Bundle package has an invalid number of entries")
             if len(names) != len(set(names)):
                 raise BundlePackageError("Bundle package contains duplicate paths")
             if sum(entry.file_size for entry in entries) > max_uncompressed_bytes:
@@ -140,25 +184,35 @@ def validate_ota_package(package_path: Path, max_uncompressed_bytes: int) -> Non
                 files[entry.filename] = entry
 
             manifest_name = "ota-manifest.json"
-            entrypoint = "index.android.bundle"
+            entrypoint = platform_entrypoint(platform)
             if manifest_name not in files or entrypoint not in files:
                 raise BundlePackageError("Bundle package is missing its manifest or entrypoint")
+            if files[manifest_name].file_size > MAX_PACKAGE_MANIFEST_BYTES:
+                raise BundlePackageError("Bundle package manifest exceeds the allowed size")
 
-            internal_manifest = json.loads(archive.read(manifest_name))
+            manifest_bytes, actual_expanded_bytes, _, _ = read_zip_entry(
+                archive,
+                files[manifest_name],
+                min(MAX_PACKAGE_MANIFEST_BYTES, max_uncompressed_bytes),
+                collect=True,
+            )
+            internal_manifest = json.loads(manifest_bytes)
             if internal_manifest.get("format_version") != 1:
                 raise BundlePackageError("Unsupported OTA package format")
             if internal_manifest.get("entrypoint") != entrypoint:
                 raise BundlePackageError("OTA package entrypoint is invalid")
-            if internal_manifest.get("entrypoint_format") not in (
-                "javascript-source",
-                "hermes-bytecode",
-            ):
-                raise BundlePackageError("OTA package entrypoint format is invalid")
+            if internal_manifest.get("entrypoint_format") != "hermes-bytecode":
+                raise BundlePackageError("OTA package entrypoint must be Hermes bytecode")
 
-            entrypoint_bytes = archive.read(entrypoint)
-            if hashlib.sha256(entrypoint_bytes).hexdigest() != internal_manifest.get(
-                "entrypoint_sha256"
-            ):
+            _, entrypoint_size, entrypoint_hash, entrypoint_header = read_zip_entry(
+                archive,
+                files[entrypoint],
+                max_uncompressed_bytes - actual_expanded_bytes,
+            )
+            actual_expanded_bytes += entrypoint_size
+            if entrypoint_header != bytes((0xC6, 0x1F, 0xBC, 0x03)):
+                raise BundlePackageError("OTA package entrypoint has an invalid Hermes bytecode header")
+            if entrypoint_hash != internal_manifest.get("entrypoint_sha256"):
                 raise BundlePackageError("Bundle entrypoint hash does not match package manifest")
 
             expected_files = {manifest_name, entrypoint}
@@ -185,10 +239,21 @@ def validate_ota_package(package_path: Path, max_uncompressed_bytes: int) -> Non
                 ):
                     raise BundlePackageError("Package manifest references an invalid asset")
                 seen_assets.add(asset_path)
-                asset_bytes = archive.read(asset_path)
-                if len(asset_bytes) != asset.get("size_bytes"):
+                expected_size = asset.get("size_bytes")
+                expected_hash = asset.get("sha256")
+                if not isinstance(expected_size, int) or expected_size < 0:
+                    raise BundlePackageError(f"Asset size is invalid: {asset_path}")
+                if not isinstance(expected_hash, str):
+                    raise BundlePackageError(f"Asset hash is invalid: {asset_path}")
+                _, asset_size, asset_hash, _ = read_zip_entry(
+                    archive,
+                    files[asset_path],
+                    max_uncompressed_bytes - actual_expanded_bytes,
+                )
+                actual_expanded_bytes += asset_size
+                if asset_size != expected_size:
                     raise BundlePackageError(f"Asset size does not match package manifest: {asset_path}")
-                if hashlib.sha256(asset_bytes).hexdigest() != asset.get("sha256"):
+                if asset_hash != expected_hash:
                     raise BundlePackageError(f"Asset hash does not match package manifest: {asset_path}")
                 expected_files.add(asset_path)
 

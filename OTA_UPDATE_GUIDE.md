@@ -154,3 +154,80 @@ These admin operations require `Authorization: Bearer <OTA_ADMIN_TOKEN>`.
 | Version conflict (409) | The version is not greater than the latest release for that app ID, runtime version, and channel. |
 | The app reports no update | Check app ID, runtime version, channel, current version, rollout eligibility, and that the release is active. |
 | `[Errno 48] Address already in use` | Port 8000 is already occupied. Stop the existing Uvicorn process or start this instance on another port. |
+
+## iOS OTA release
+
+The API release contract is shared by both platforms. iOS releases use the iOS app's exact app ID, runtime version, channel, and a monotonically increasing version within that lane. iOS package ZIPs contain `main.jsbundle` Hermes bytecode, `ota-manifest.json`, and declared Metro assets. They cannot update native app code or replace an IPA.
+
+### Build, sign, and publish
+
+Install dependencies in the consuming React Native app first, then run the iOS bundle builder from this repository root:
+
+```sh
+python -m tools.build_ios_bundle \
+  --app-dir "/absolute/path/to/your/react-native-app" \
+  --output storage/outgoing/ota-ios.zip
+```
+
+The builder invokes the app's React Native CLI and matching Hermes compiler. Sign with the publisher private key whose corresponding public key is configured on the API and trusted by the target iOS app:
+
+```sh
+NEXT_VERSION=1 # set to one greater than the highest version in this app/runtime/channel lane
+python -m tools.ota_signing sign-manifest \
+  --bundle storage/outgoing/ota-ios.zip \
+  --platform ios \
+  --private-key .local-keys/development/ota-publisher-private.pem \
+  --app-id com.example.ios \
+  --runtime-version rn-0.88-ios-v1 \
+  --version "$NEXT_VERSION" \
+  --manifest-output "storage/outgoing/ios-${NEXT_VERSION}-manifest.json" \
+  --signature-output "storage/outgoing/ios-${NEXT_VERSION}-signature.txt"
+```
+
+Publish to the same channel compiled into the iOS app:
+
+```sh
+python -m tools.publish_release \
+  --bundle storage/outgoing/ota-ios.zip \
+  --manifest "storage/outgoing/ios-${NEXT_VERSION}-manifest.json" \
+  --signature "storage/outgoing/ios-${NEXT_VERSION}-signature.txt" \
+  --channel development \
+  --rollout 100
+```
+
+The publish API verifies the signature, signed artifact size/hash, iOS entrypoint, Hermes format/header, ZIP layout, and per-file integrity before making the release active. Update checks filter by platform, app ID, runtime, and channel, so iOS clients cannot receive Android packages.
+
+For a local check, run the service and configure a release iOS app with the same origin and matching public key. Simulator-only development may use explicitly allowed loopback HTTP; use HTTPS for physical devices and all shared/production environments. The app downloads and stages the release, then the user closes and reopens the app to activate it.
+
+The production orchestrator `tools.release_production` currently builds Android bundles only. For iOS production releases, build with `build_ios_bundle.py`, sign with the production app ID/runtime and production private key, then publish using `.env.production`:
+
+```sh
+python -m tools.ota_signing sign-manifest \
+  --bundle storage/outgoing/ota-ios.zip \
+  --platform ios \
+  --private-key .local-keys/production/ota-publisher-private.pem \
+  --app-id com.example.ios \
+  --runtime-version rn-0.88-ios-v1 \
+  --version "$NEXT_VERSION" \
+  --manifest-output "storage/outgoing/ios-${NEXT_VERSION}-manifest.json" \
+  --signature-output "storage/outgoing/ios-${NEXT_VERSION}-signature.txt"
+
+python -m tools.publish_production_release \
+  --env-file .env.production \
+  --bundle storage/outgoing/ota-ios.zip \
+  --manifest "storage/outgoing/ios-${NEXT_VERSION}-manifest.json" \
+  --signature "storage/outgoing/ios-${NEXT_VERSION}-signature.txt" \
+  --rollout 5
+```
+
+Use the production public key configured on the API and embedded in the production iOS app. Never commit or embed the private key or admin token.
+
+### Server-side iOS verification
+
+Run the full service suite from the repository root:
+
+```sh
+PYTHONPATH=. ./.venv/bin/pytest -q
+```
+
+Tests cover package integrity and platform isolation; simulator/device activation and rollback are client-level checks and are not established by server tests.

@@ -87,19 +87,30 @@ def make_signed_bundle(
     *,
     app_id: str = "com.ota",
     runtime_version: str = "rn-0.88.0-android-1",
+    platform: str = "android",
+    bundle_format: str = "hermes-bytecode",
 ) -> SignedBundle:
     temporary_path: Path = environment["tmp_path"]
-    bundle_source = temporary_path / f"bundle-{version}.js"
-    bundle_source.write_text(f"console.log('OTA release {version}');\n", encoding="utf-8")
-    assets_dir = temporary_path / f"assets-{version}"
+    bundle_source = temporary_path / f"bundle-{platform}-{version}.hbc"
+    bundle_bytes = f"OTA release {version}".encode()
+    if bundle_format == "hermes-bytecode":
+        bundle_bytes = bytes((0xC6, 0x1F, 0xBC, 0x03)) + bundle_bytes
+    bundle_source.write_bytes(bundle_bytes)
+    assets_dir = temporary_path / f"assets-{platform}-{version}"
     assets_dir.mkdir(exist_ok=True)
-    (assets_dir / f"image-{version}.png").write_bytes(bytes([version, 2, 3]))
-    bundle_path = temporary_path / f"release-{version}.zip"
-    build_deterministic_package(bundle_source, assets_dir, bundle_path)
+    (assets_dir / f"image-{platform}-{version}.png").write_bytes(bytes([version, 2, 3]))
+    bundle_path = temporary_path / f"release-{platform}-{version}.zip"
+    build_deterministic_package(
+        bundle_source,
+        assets_dir,
+        bundle_path,
+        bundle_format=bundle_format,
+        platform=platform,
+    )
 
     manifest = ReleaseManifest(
         release_id=uuid4(),
-        platform="android",
+        platform=platform,
         app_id=app_id,
         runtime_version=runtime_version,
         version=version,

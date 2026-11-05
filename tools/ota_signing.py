@@ -58,7 +58,7 @@ def generate_keys(args: argparse.Namespace) -> None:
 
     print(f"Private signing key: {private_key_path}")
     print(f"Public verification key: {public_key_path}")
-    print("Keep the private key out of Git and out of the Android app.")
+    print("Keep the private key out of Git and out of all mobile apps.")
 
 
 def sign_manifest(args: argparse.Namespace) -> None:
@@ -66,13 +66,17 @@ def sign_manifest(args: argparse.Namespace) -> None:
     if not bundle_path.is_file():
         raise SystemExit(f"Bundle not found: {bundle_path}")
     try:
-        validate_ota_package(bundle_path, max_uncompressed_bytes=500 * 1024 * 1024)
+        validate_ota_package(
+            bundle_path,
+            max_uncompressed_bytes=500 * 1024 * 1024,
+            platform=args.platform,
+        )
         with zipfile.ZipFile(bundle_path) as archive:
             package_manifest = json.loads(archive.read("ota-manifest.json"))
     except (OSError, ValueError, zipfile.BadZipFile) as exc:
         raise SystemExit(f"Bundle is not a valid OTA package: {exc}") from exc
     if package_manifest["entrypoint_format"] != "hermes-bytecode":
-        raise SystemExit("Android OTA releases must contain a Hermes bytecode bundle")
+        raise SystemExit(f"{args.platform.capitalize()} OTA releases must contain a Hermes bytecode bundle")
 
     with args.private_key.open("rb") as key_file:
         private_key = serialization.load_pem_private_key(key_file.read(), password=None)
@@ -84,7 +88,7 @@ def sign_manifest(args: argparse.Namespace) -> None:
     manifest = ReleaseManifest(
         manifest_version=1,
         release_id=args.release_id or uuid4(),
-        platform="android",
+        platform=args.platform,
         app_id=args.app_id,
         runtime_version=args.runtime_version,
         version=args.version,
@@ -122,6 +126,10 @@ def main() -> None:
     sign_parser.add_argument("--bundle", type=Path, required=True)
     sign_parser.add_argument("--private-key", type=Path, required=True)
     sign_parser.add_argument("--app-id", required=True)
+    sign_parser.add_argument(
+        "--platform", choices=("android", "ios"), default="android",
+        help="Target platform (default: android)",
+    )
     sign_parser.add_argument("--runtime-version", required=True)
     sign_parser.add_argument("--version", type=int, required=True)
     sign_parser.add_argument("--release-id", type=UUID)

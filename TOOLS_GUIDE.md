@@ -19,7 +19,8 @@ python -m pip install -r requirements.txt
 | Script | Use it when | Does not do |
 | --- | --- | --- |
 | `build_android_bundle.py` | Build and package an Android Hermes OTA bundle from the host React Native app. | Sign or upload the bundle; build an APK. |
-| `ota_signing.py` | Generate a P-256 signing keypair once, or sign a bundle's release manifest. | Upload a release. |
+| `build_ios_bundle.py` | Build and package an iOS Hermes OTA bundle from the host React Native app. | Sign or upload the bundle; build an IPA. |
+| `ota_signing.py` | Generate a P-256 signing keypair once, or sign an Android/iOS bundle's release manifest. | Upload a release. |
 | `publish_release.py` | Upload an already-built and signed release to an API, commonly a local or development server. | Build or sign the release. |
 | `release_production.py` | Run the complete production sequence: choose version, build or reuse bundle, sign, upload. | Build the native Android APK. |
 | `publish_production_release.py` | Upload an already-built and signed production release using `.env.production`. | Build or sign the release. |
@@ -41,11 +42,23 @@ python -m tools.build_android_bundle \
 
 If Metro reports that it cannot resolve a JavaScript package, the failure is in the host app's dependency/install/import setup; the Python script is reporting Metro's non-zero exit.
 
+## `build_ios_bundle.py`
+
+Builds a Metro iOS release bundle, compiles it to Hermes bytecode using the host app's matching Hermes compiler, and packages `main.jsbundle` with Metro assets into a deterministic ZIP. The host app must have its dependencies installed and expose the React Native CLI and Hermes compiler under `node_modules`.
+
+```sh
+python -m tools.build_ios_bundle \
+  --app-dir "/absolute/path/to/your/react-native-app" \
+  --output storage/outgoing/ota-ios.zip
+```
+
+`--output` defaults to `storage/outgoing/ota-ios.zip`; `OTA_APP_DIR` may be used instead of `--app-dir`. This produces an OTA ZIP, not an IPA. The package includes the platform entrypoint, `ota-manifest.json`, and declared Metro assets.
+
 ## `ota_signing.py`
 
 ### Generate a keypair once
 
-Use this only when creating a new publisher identity. Do not run it to repair a path issue or replace a key already trusted by installed apps. The Android app and API must use the corresponding public key, and the private key must remain private.
+Use this only when creating a new publisher identity. Do not run it to repair a path issue or replace a key already trusted by installed apps. The target app and API must use the corresponding public key, and the private key must remain private.
 
 ```sh
 python -m tools.ota_signing generate-keys \
@@ -53,16 +66,17 @@ python -m tools.ota_signing generate-keys \
   --public-key .local-keys/development/ota-publisher-public.pem
 ```
 
-The private key is created with owner-only permissions. The public key should be configured in the API (`OTA_SIGNING_PUBLIC_KEY_PATH`) and embedded in the compatible Android app. Keep the private key out of Git and out of the app.
+The private key is created with owner-only permissions. The public key should be configured in the API (`OTA_SIGNING_PUBLIC_KEY_PATH`) and embedded in compatible app builds. Keep the private key out of Git and out of all apps.
 
 ### Sign an OTA package
 
-Signing validates that the ZIP is a valid OTA package containing Hermes bytecode, calculates its SHA-256 and size, builds a manifest, and signs the canonical manifest with P-256 ECDSA.
+Signing validates that the ZIP is a valid platform OTA package containing Hermes bytecode, calculates its SHA-256 and size, builds a manifest, and signs the canonical manifest with P-256 ECDSA. Android remains the default platform; pass `--platform ios` for an iOS ZIP.
 
 ```sh
 NEXT_VERSION=7
 python -m tools.ota_signing sign-manifest \
   --bundle storage/outgoing/ota-android.zip \
+  --platform android \
   --private-key .local-keys/development/ota-publisher-private.pem \
   --app-id com.example.app \
   --runtime-version rn-0.88.0-android-v1 \
@@ -73,9 +87,23 @@ python -m tools.ota_signing sign-manifest \
 
 Replace the example app ID and runtime version with the exact values used by the installed app. The release version must be greater than the existing version for the same app ID, runtime version, and channel. Signing alone does not check the server's release history; the API enforces version ordering during upload.
 
+For iOS, build with `build_ios_bundle.py` and use the app ID/runtime configured in the target IPA:
+
+```sh
+python -m tools.ota_signing sign-manifest \
+  --bundle storage/outgoing/ota-ios.zip \
+  --platform ios \
+  --private-key .local-keys/development/ota-publisher-private.pem \
+  --app-id com.example.ios \
+  --runtime-version rn-0.88-ios-v1 \
+  --version 1 \
+  --manifest-output storage/outgoing/ios-manifest.json \
+  --signature-output storage/outgoing/ios-signature.txt
+```
+
 ## `publish_release.py`
 
-Uploads a prepared ZIP, manifest, and signature to `POST /api/v1/admin/releases`. It gets `OTA_API_BASE_URL` and `OTA_ADMIN_TOKEN` from the server repository's `.env` via application settings. `DATABASE_URL` must also be present because settings require it, although this publishing script does not connect to the database.
+Uploads a prepared Android or iOS ZIP, manifest, and signature to `POST /api/v1/admin/releases`. The signed manifest platform must match the package entrypoint. It gets `OTA_API_BASE_URL` and `OTA_ADMIN_TOKEN` from the server repository's `.env` via application settings. `DATABASE_URL` must also be present because settings require it, although this publishing script does not connect to the database.
 
 ```sh
 python -m tools.publish_release \
@@ -123,7 +151,7 @@ Without `--version`, the tool selects the latest matching production version plu
 
 ## `publish_production_release.py`
 
-Uploads an already-built and signed bundle to the production channel using credentials from `.env.production`. It is normally called by `release_production.py`; use it directly when all three artifacts already exist.
+Uploads an already-built and signed bundle to the production channel using credentials from `.env.production`. It is normally called by `release_production.py`; use it directly when all three artifacts already exist. This uploader is platform-neutral and can publish a signed iOS ZIP when the manifest says `ios` and the API is configured with the matching public key.
 
 ```sh
 python -m tools.publish_production_release \

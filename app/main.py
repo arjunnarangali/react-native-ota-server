@@ -7,7 +7,7 @@ from app.core.config import settings
 app = FastAPI(
     title=settings.app_name,
     version="0.1.0",
-    description="Self-hosted OTA update service for the React Native learning project.",
+    description="Self-hosted signed OTA update service for Android and iOS React Native clients.",
 )
 
 app.include_router(health_router)

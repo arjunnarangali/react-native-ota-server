@@ -173,7 +173,7 @@ def download_release_bundle(
     response_model=AdminReleaseResponse,
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_admin)],
-    summary="Publish a signed Android bundle",
+    summary="Publish a signed platform bundle",
 )
 async def publish_release(
     manifest: Annotated[str, Form()],
@@ -227,7 +227,11 @@ async def publish_release(
         if staged.sha256 != signed_manifest.artifact_sha256:
             raise HTTPException(status_code=400, detail="Bundle hash does not match signed manifest")
         try:
-            validate_ota_package(staged.temporary_path, settings.ota_max_bundle_size_bytes * 5)
+            validate_ota_package(
+                staged.temporary_path,
+                settings.ota_max_bundle_size_bytes * 5,
+                platform=signed_manifest.platform,
+            )
         except BundlePackageError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

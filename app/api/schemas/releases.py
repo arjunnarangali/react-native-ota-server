@@ -6,13 +6,15 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 
 class ReleaseManifest(BaseModel):
-    """Immutable, publisher-signed metadata for one Android bundle artifact."""
+    """Immutable, publisher-signed metadata for one platform bundle artifact."""
 
     model_config = ConfigDict(extra="forbid")
 
     manifest_version: Literal[1] = 1
     release_id: UUID
-    platform: Literal["android"]
+    platform: Literal["android", "ios"] = Field(
+        description="Target operating system for this release.", examples=["ios"]
+    )
     app_id: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$", max_length=255)
     runtime_version: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
     version: int = Field(ge=1, le=2_147_483_647)
@@ -22,7 +24,10 @@ class ReleaseManifest(BaseModel):
 
 
 class UpdateCheckRequest(BaseModel):
-    platform: Literal["android"]
+    platform: Literal["android", "ios"] = Field(
+        description="Client platform; releases are isolated between Android and iOS.",
+        examples=["ios"],
+    )
     app_id: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$", max_length=255)
     runtime_version: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
     channel: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
